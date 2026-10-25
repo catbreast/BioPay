@@ -97,10 +97,13 @@ object SettingsDialog {
 
         val toggleFp = M3Switch(context, t).apply { isChecked = fpOn }
         val toggleFace = M3Switch(context, t).apply { isChecked = faceOn }
+        val togglePin = M3Switch(context, t).apply { isChecked = state.prefs.getPinFallback() }
 
         bioCard.addView(makeSettingRow(context, "启用指纹支付", "请确保设备已开启指纹解锁", toggleFp, t))
         bioCard.addView(makeDivider(context, t))
         bioCard.addView(makeSettingRow(context, "启用面容支付", "请确保设备已开启面容解锁", toggleFace, t))
+        bioCard.addView(makeDivider(context, t))
+        bioCard.addView(makeSettingRow(context, "锁屏密码兜底", "指纹或面容不可用时，改用锁屏密码验证", togglePin, t))
         root.addView(bioCard)
 
         val pwdCard = makeCard(context, t)
@@ -151,14 +154,14 @@ object SettingsDialog {
             }
         }
 
-        root.addView(makeButtonRow(context, dialogHost, pwdInput, state, t) {
+        root.addView(makeButtonRow(context, dialogHost, pwdInput, state, t, {
             when {
                 toggleFp.isChecked && toggleFace.isChecked -> BiometricType.BOTH
                 toggleFp.isChecked -> BiometricType.FINGERPRINT
                 toggleFace.isChecked -> BiometricType.FACE
                 else -> BiometricType.DISABLED
             }
-        })
+        }) { togglePin.isChecked })
 
         val updatePwd = { setPwdEnabled(pwdInput, toggleFp.isChecked || toggleFace.isChecked) }
         toggleFp.onCheckedChangeListener = { _ -> updatePwd() }
@@ -230,7 +233,7 @@ object SettingsDialog {
         }
     }
 
-    private fun makeButtonRow(context: Context, dialogHost: DialogHost, pwdInput: M3Field, state: AppRuntime, t: ThemeColors, getSelectedType: () -> Int): LinearLayout {
+    private fun makeButtonRow(context: Context, dialogHost: DialogHost, pwdInput: M3Field, state: AppRuntime, t: ThemeColors, getSelectedType: () -> Int, getPinFallback: () -> Boolean): LinearLayout {
         return LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -245,7 +248,7 @@ object SettingsDialog {
                 SettingsActions.dismissDialog(dialogHost)
             })
             addView(makeBtn(context, "保存", t.primary, t.onPrimary, t.ripple, 0) {
-                SettingsActions.handleSave(context, dialogHost, pwdInput, state, getSelectedType())
+                SettingsActions.handleSave(context, dialogHost, pwdInput, state, getSelectedType(), getPinFallback())
             })
         }
     }

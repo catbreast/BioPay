@@ -29,11 +29,11 @@ object SettingsActions {
         }
     }
 
-    fun handleSave(context: Context, host: DialogHost, input: M3Field, state: AppRuntime, type: Int) {
+    fun handleSave(context: Context, host: DialogHost, input: M3Field, state: AppRuntime, type: Int, pinFallback: Boolean) {
         if (state.isClosed || !host.isOpen || host.isBusy) return
         if (type == BiometricType.DISABLED) {
             save(context, host, state, "生物支付已关闭") {
-                state.prefs.setBiometricMode(type)
+                state.prefs.setBiometricMode(type, pinFallback)
             }
             return
         }
@@ -43,8 +43,8 @@ object SettingsActions {
                 PasswordVersionPolicy.requiresReentry(state.prefs.getEncodedPassword(), state.prefs.getPasswordVersion())) {
                 showToast(context, "请重新录入该应用的支付密码")
             } else if (!state.prefs.getEncodedPassword().isNullOrEmpty()) {
-                authenticateWithBiometric(context, host, state, biometricType = type) {
-                    state.prefs.setBiometricMode(type)
+                authenticateWithBiometric(context, host, state, biometricType = type, pinFallback = pinFallback) {
+                    state.prefs.setBiometricMode(type, pinFallback)
                 }
             } else showToast(context, "请输入支付密码")
             return
@@ -54,9 +54,9 @@ object SettingsActions {
             return
         }
         val chars = CharArray(password.length) { password[it] }
-        authenticateWithBiometric(context, host, state, biometricType = type, cleanup = { chars.fill('\u0000') }) {
+        authenticateWithBiometric(context, host, state, biometricType = type, pinFallback = pinFallback, cleanup = { chars.fill('\u0000') }) {
             val cipher = PasswordCipher.createEncryptionCipher(state.app, state.adapter.app.packageName)
-            state.prefs.savePassword(chars, cipher, PasswordVersionPolicy.current, type).isSuccess
+            state.prefs.savePassword(chars, cipher, PasswordVersionPolicy.current, type, pinFallback).isSuccess
         }
     }
 
@@ -93,6 +93,7 @@ object SettingsActions {
         state: AppRuntime,
         successMsg: String = "生物支付已启用",
         biometricType: Int = state.prefs.getBiometricType(),
+        pinFallback: Boolean = state.prefs.getPinFallback(),
         cleanup: () -> Unit = {},
         onSuccess: () -> Boolean
     ) {
@@ -106,9 +107,11 @@ object SettingsActions {
         try {
             val builder = BiometricPrompt.Builder(context)
                 .setTitle(BioPayPrompt.TITLE)
-                .setNegativeButton("取消", context.mainExecutor) { _, _ ->
+            if (BiometricPromptPolicy.negativeButtonAllowed(pinFallback)) {
+                builder.setNegativeButton("取消", context.mainExecutor) { _, _ ->
                     if (dialogHost.finishAuthentication(attemptId)) cleanup()
                 }
+            }
             val callback = object : BiometricPrompt.AuthenticationCallback() {
                 override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult?) {
                     if (!dialogHost.finishAuthentication(attemptId)) return
@@ -123,7 +126,7 @@ object SettingsActions {
                     }
                 }
             }
-            BiometricPromptPolicy.configure(builder, biometricType).build()
+            BiometricPromptPolicy.configure(builder, biometricType, pinFallback).build()
                 .authenticate(signal, context.mainExecutor, callback)
         } catch (error: Exception) {
             ModuleLog.d(error) { "settings authentication startup failed" }

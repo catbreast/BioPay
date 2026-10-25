@@ -104,7 +104,8 @@ class ConfigStore(
             values[PrefKeys.prefKeyOn] as? Boolean ?: false,
             values[KEY_PASSWORD_VERSION] as? Int ?: 0,
             values[KEY_BIOMETRIC_TYPE] as? Int ?: BiometricType.DISABLED,
-            values[KEY_SETTINGS_REVISION] as? Long ?: 0L
+            values[KEY_SETTINGS_REVISION] as? Long ?: 0L,
+            values[KEY_PIN_FALLBACK] as? Boolean ?: false
         )
     }
 
@@ -120,6 +121,7 @@ class ConfigStore(
                 .putBoolean(PrefKeys.prefKeyOn, base.enabled)
                 .putInt(KEY_PASSWORD_VERSION, base.passwordVersion)
                 .putInt(KEY_BIOMETRIC_TYPE, base.biometricType)
+                .putBoolean(KEY_PIN_FALLBACK, base.pinFallback)
             change(editor)
             editor.putLong(KEY_SETTINGS_REVISION, base.revision + 1L)
             if (!editor.commit()) return false
@@ -159,7 +161,7 @@ class ConfigStore(
             PasswordVersionPolicy.requiresReentry(it.encryptedPassword, it.passwordVersion))
     }
 
-    internal fun savePassword(password: CharArray, cipher: javax.crypto.Cipher, passwordVersion: Int, biometricType: Int = getBiometricType()): Result<Unit> {
+    internal fun savePassword(password: CharArray, cipher: javax.crypto.Cipher, passwordVersion: Int, biometricType: Int = getBiometricType(), pinFallback: Boolean = getPinFallback()): Result<Unit> {
         return try {
             val encrypted = PasswordCipher.encrypt(password, cipher)
             if (!writeSettings {
@@ -167,6 +169,7 @@ class ConfigStore(
                 putBoolean(PrefKeys.prefKeyOn, true)
                 putInt(KEY_PASSWORD_VERSION, passwordVersion)
                 putInt(KEY_BIOMETRIC_TYPE, biometricType)
+                putBoolean(KEY_PIN_FALLBACK, pinFallback)
                 putString(KEY_PASSWORD_OWNER, app.packageName)
             }) error("payment settings could not be saved")
             Result.success(Unit)
@@ -182,17 +185,21 @@ class ConfigStore(
             putString(PrefKeys.prefKeyPwd, "")
             putInt(KEY_PASSWORD_VERSION, 0)
             putInt(KEY_BIOMETRIC_TYPE, BiometricType.DISABLED)
+            putBoolean(KEY_PIN_FALLBACK, false)
             remove(KEY_PASSWORD_OWNER)
         }
     }
 
-    internal fun setBiometricMode(type: Int): Boolean {
+    internal fun setBiometricMode(type: Int, pinFallback: Boolean = getPinFallback()): Boolean {
         require(type in BiometricType.DISABLED..BiometricType.FACE)
         return writeSettings {
             putBoolean(PrefKeys.prefKeyOn, type != BiometricType.DISABLED)
             putInt(KEY_BIOMETRIC_TYPE, type)
+            putBoolean(KEY_PIN_FALLBACK, pinFallback)
         }
     }
+
+    fun getPinFallback(): Boolean = settings().pinFallback
 
     fun getBiometricType(): Int = settings().let {
         if (encodedPassword(it) == null) BiometricType.DISABLED else it.biometricType

@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 internal const val KEY_PASSWORD_VERSION = "password_version"
 internal const val KEY_BIOMETRIC_TYPE = "bt"
+internal const val KEY_PIN_FALLBACK = "pin_fb"
 internal const val KEY_PASSWORD_OWNER = "password_owner_package"
 internal const val KEY_SETTINGS_REVISION = "payment_settings_revision"
 private const val ACTION_SETTINGS_CHANGED = "io.github.kiriashi.biopay.PAYMENT_SETTINGS_CHANGED"
@@ -170,6 +171,7 @@ private fun PaymentSettings.toBundle(): Bundle = Bundle().apply {
     putInt(KEY_PASSWORD_VERSION, passwordVersion)
     putInt(KEY_BIOMETRIC_TYPE, biometricType)
     putLong(KEY_SETTINGS_REVISION, revision)
+    putBoolean(KEY_PIN_FALLBACK, pinFallback)
 }
 
 private fun Bundle.readSettings(): PaymentSettings = PaymentSettings(
@@ -178,5 +180,6 @@ private fun Bundle.readSettings(): PaymentSettings = PaymentSettings(
     getBoolean(PrefKeys.prefKeyOn, false),
     getInt(KEY_PASSWORD_VERSION, 0),
     getInt(KEY_BIOMETRIC_TYPE, BiometricType.DISABLED),
-    getLong(KEY_SETTINGS_REVISION, 0L)
+    getLong(KEY_SETTINGS_REVISION, 0L),
+    getBoolean(KEY_PIN_FALLBACK, false)
 )

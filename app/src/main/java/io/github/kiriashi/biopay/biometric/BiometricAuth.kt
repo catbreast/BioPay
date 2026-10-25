@@ -91,8 +91,10 @@ object BiometricAuth {
                     val executor = activity.mainExecutor
                     val builder = BiometricPrompt.Builder(activity)
                         .setTitle(BioPayPrompt.TITLE)
-                        .setNegativeButton("取消", executor) { _, _ -> callback.cancel() }
-                    BiometricPromptPolicy.configure(builder, biometricType).build()
+                    if (BiometricPromptPolicy.negativeButtonAllowed(config.pinFallback)) {
+                        builder.setNegativeButton("取消", executor) { _, _ -> callback.cancel() }
+                    }
+                    BiometricPromptPolicy.configure(builder, biometricType, config.pinFallback).build()
                         .authenticate(attempt.signal, executor, callback)
                     if (state.session.isCurrentAuthentication(attempt.id)) {
                         // INVISIBLE preserves external payment keyboard attachment and the active prompt.

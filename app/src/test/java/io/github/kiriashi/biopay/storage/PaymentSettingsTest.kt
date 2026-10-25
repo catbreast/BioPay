@@ -44,6 +44,14 @@ class PaymentSettingsTest {
     }
 
     @Test
+    fun pinFallbackDefaultsOffAndPropagatesToPaymentConfig() {
+        val original = settings()
+        assertEquals(false, original.pinFallback)
+        assertEquals(false, original.activeFor(PaymentApp.QQ)?.pinFallback)
+        assertEquals(true, original.copy(pinFallback = true).activeFor(PaymentApp.QQ)?.pinFallback)
+    }
+
+    @Test
     fun disabledOrInvalidSettingsCannotAuthorizePayment() {
         val original = settings()
         assertNull(original.copy(enabled = false).activeFor(PaymentApp.QQ))

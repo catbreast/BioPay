@@ -89,6 +89,7 @@ internal object SettingsBroadcastAuth {
             data.writeInt(settings.passwordVersion)
             data.writeInt(settings.biometricType)
             data.writeLong(settings.revision)
+            data.writeBoolean(settings.pinFallback)
         }
         bytes.toByteArray()
     }

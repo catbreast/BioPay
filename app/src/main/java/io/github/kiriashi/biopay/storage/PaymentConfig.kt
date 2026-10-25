@@ -14,7 +14,8 @@ internal data class PaymentConfig(
     val encryptedPassword: String,
     val passwordVersion: Int,
     val biometricType: Int,
-    val revision: Long
+    val revision: Long,
+    val pinFallback: Boolean = false
 )
 
 internal data class PaymentSettings(
@@ -23,7 +24,8 @@ internal data class PaymentSettings(
     val enabled: Boolean,
     val passwordVersion: Int,
     val biometricType: Int,
-    val revision: Long
+    val revision: Long,
+    val pinFallback: Boolean = false
 ) {
     fun latest(other: PaymentSettings): PaymentSettings =
         if (revision > other.revision) this else other
@@ -41,6 +43,6 @@ internal data class PaymentSettings(
     fun activeFor(app: PaymentApp): PaymentConfig? {
         if (!enabled || biometricType !in BiometricType.BOTH..BiometricType.FACE) return null
         val password = encodedPasswordFor(app) ?: return null
-        return PaymentConfig(app, password, passwordVersion, biometricType, revision)
+        return PaymentConfig(app, password, passwordVersion, biometricType, revision, pinFallback)
     }
 }
