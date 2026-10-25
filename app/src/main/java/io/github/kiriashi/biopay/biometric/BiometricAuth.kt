@@ -7,6 +7,7 @@ package io.github.kiriashi.biopay.biometric
 
 import android.app.Activity
 import android.hardware.biometrics.BiometricPrompt
+import android.os.CancellationSignal
 import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
@@ -48,7 +49,18 @@ object BiometricAuth {
         val attempt = state.session.beginAuthentication() ?: return false
         try {
             state.session.suppressInputMethod()
-            return state.paymentWorker.submit(
+            val callback = BiometricAuthCallback(
+                activity, keyboardView, config, state, sessionId, attempt.id, attempt.signal
+            )
+            if (!state.session.onAuthenticationEnded(attempt.id, callback::dispose)) {
+                callback.dispose()
+                restoreKeyboard(state, sessionId, attempt.id)
+                return false
+            }
+            // Prepare decryption on the crypto worker concurrently with the prompt: the
+            // ciphertext is only needed after authentication succeeds, so the prompt no
+            // longer waits on Keystore latency before it can appear.
+            val submitted = state.paymentWorker.submit(
                 work = {
                     if (!state.isClosed && state.session.isCurrentSession(sessionId) &&
                         state.session.isCurrentAuthentication(attempt.id)) {
@@ -60,54 +72,51 @@ object BiometricAuth {
                 discard = { it?.ciphertext?.fill(0) }
             ) { result ->
                 val operation = result.getOrNull()
-                val preparationFailure = currentFailure(state, config, sessionId, attempt.id, activity)
-                    ?: when {
-                        state.session.getCurrentKeyboardView() !== keyboardView -> "keyboard replaced"
-                        !keyboardView.isAttachedToWindow -> "keyboard detached"
-                        keyboardView.windowVisibility != View.VISIBLE || !keyboardView.isShown -> "keyboard hidden"
-                        keyboardView.rootView.context.findActivity()?.let { it !== activity } == true -> "window owner changed"
-                        else -> null
-                    }
-                if (preparationFailure != null) {
-                    ModuleLog.d { "authentication preparation discarded: reason=$preparationFailure, app=${state.adapter.app}, session=$sessionId, attempt=${attempt.id}" }
-                    operation?.ciphertext?.fill(0)
-                    restoreKeyboard(state, sessionId, attempt.id)
-                    return@submit
-                }
                 if (operation == null) {
                     result.exceptionOrNull()?.let { ModuleLog.w(it) { "password decryption preparation failed" } }
-                    restoreKeyboard(state, sessionId, attempt.id)
-                    return@submit
+                    callback.onCryptoFailed()
+                } else {
+                    callback.onCryptoReady(operation)
                 }
-                val callback = BiometricAuthCallback(
-                    activity, keyboardView, operation, config, state, sessionId, attempt.id
-                )
-                if (!state.session.onAuthenticationEnded(attempt.id, callback::dispose)) {
-                    callback.dispose()
-                    restoreKeyboard(state, sessionId, attempt.id)
-                    return@submit
-                }
-                try {
-                    val executor = activity.mainExecutor
-                    val builder = BiometricPrompt.Builder(activity)
-                        .setTitle(BioPayPrompt.TITLE)
-                    if (BiometricPromptPolicy.negativeButtonAllowed(config.pinFallback)) {
-                        builder.setNegativeButton("取消", executor) { _, _ -> callback.cancel() }
-                    }
-                    BiometricPromptPolicy.configure(builder, biometricType, config.pinFallback).build()
-                        .authenticate(attempt.signal, executor, callback)
-                    if (state.session.isCurrentAuthentication(attempt.id)) {
-                        // INVISIBLE preserves external payment keyboard attachment and the active prompt.
-                        keyboardView.visibility = View.INVISIBLE
-                        ModuleLog.d { "trigger: type=$biometricType, session=$sessionId, attempt=${attempt.id}" }
-                    }
-                } catch (error: Exception) {
-                    callback.cancel()
-                    ModuleLog.w(error) { "biometric auth failed" }
-                }
-            }.also { submitted ->
-                if (!submitted) restoreKeyboard(state, sessionId, attempt.id)
             }
+            if (!submitted) {
+                callback.dispose()
+                restoreKeyboard(state, sessionId, attempt.id)
+                return false
+            }
+            val preparationFailure = currentFailure(state, config, sessionId, attempt.id, activity)
+                ?: when {
+                    state.session.getCurrentKeyboardView() !== keyboardView -> "keyboard replaced"
+                    !keyboardView.isAttachedToWindow -> "keyboard detached"
+                    keyboardView.windowVisibility != View.VISIBLE || !keyboardView.isShown -> "keyboard hidden"
+                    keyboardView.rootView.context.findActivity()?.let { it !== activity } == true -> "window owner changed"
+                    else -> null
+                }
+            if (preparationFailure != null) {
+                ModuleLog.d { "authentication preparation discarded: reason=$preparationFailure, app=${state.adapter.app}, session=$sessionId, attempt=${attempt.id}" }
+                callback.dispose()
+                restoreKeyboard(state, sessionId, attempt.id)
+                return false
+            }
+            try {
+                val executor = activity.mainExecutor
+                val builder = BiometricPrompt.Builder(activity)
+                    .setTitle(BioPayPrompt.TITLE)
+                if (BiometricPromptPolicy.negativeButtonAllowed(config.pinFallback)) {
+                    builder.setNegativeButton("取消", executor) { _, _ -> callback.cancel() }
+                }
+                BiometricPromptPolicy.configure(builder, biometricType, config.pinFallback).build()
+                    .authenticate(attempt.signal, executor, callback)
+                if (state.session.isCurrentAuthentication(attempt.id)) {
+                    // INVISIBLE preserves external payment keyboard attachment and the active prompt.
+                    keyboardView.visibility = View.INVISIBLE
+                    ModuleLog.d { "trigger: type=$biometricType, session=$sessionId, attempt=${attempt.id}" }
+                }
+            } catch (error: Exception) {
+                callback.cancel()
+                ModuleLog.w(error) { "biometric auth failed" }
+            }
+            return true
         } catch (e: Throwable) {
             restoreKeyboard(state, sessionId, attempt.id)
             ModuleLog.w(e) { "biometric auth failed" }
@@ -146,16 +155,17 @@ object BiometricAuth {
     private class BiometricAuthCallback(
         private val activity: Activity,
         keyboard: ViewGroup,
-        operation: PasswordCipher.DecryptOperation,
         private val config: PaymentConfig,
         private val state: AppRuntime,
         private val sessionId: Long,
-        private val attemptId: Long
+        private val attemptId: Long,
+        private val signal: CancellationSignal
     ) : BiometricPrompt.AuthenticationCallback() {
         private val window = WeakReference(keyboard.rootView as? ViewGroup)
         private val tasks = MainTasks()
         private val startedAt = SystemClock.uptimeMillis()
-        private var operation: PasswordCipher.DecryptOperation? = operation
+        private var operation: PasswordCipher.DecryptOperation? = null
+        @Volatile private var cryptoFailed = false
         private var password: CharArray? = null
         @Volatile private var ended = false
         private var authenticated = false
@@ -180,6 +190,27 @@ object BiometricAuth {
             stop("authentication cancelled")
         }
 
+        /** Main-thread delivery of the decrypt operation prepared concurrently with the prompt. */
+        fun onCryptoReady(prepared: PasswordCipher.DecryptOperation) {
+            if (ended) {
+                prepared.ciphertext.fill(0)
+                return
+            }
+            operation = prepared
+            if (authenticated && password == null && !decrypting) continueInput()
+        }
+
+        /** Preparation failed: dismiss the prompt instead of leaving it up with nothing to decrypt. */
+        fun onCryptoFailed() {
+            if (ended) return
+            cryptoFailed = true
+            if (authenticated) {
+                stop("decryption operation unavailable")
+            } else {
+                signal.cancel()
+            }
+        }
+
         override fun onAuthenticationError(errorCode: Int, errString: CharSequence?) {
             if (authenticated || ended) return
             stop("authentication error")
@@ -199,7 +230,7 @@ object BiometricAuth {
                 stop(it)
                 return
             }
-            if (operation == null) {
+            if (cryptoFailed) {
                 stop("decryption operation unavailable")
                 return
             }
@@ -269,7 +300,12 @@ object BiometricAuth {
         }
 
         private fun decrypt() {
-            val pending = operation ?: run { stop("decryption operation unavailable"); return }
+            val pending = operation ?: run {
+                // Authentication beat the crypto worker: reuse the readiness wait loop
+                // (bounded by the post-authentication deadline) instead of failing.
+                if (cryptoFailed) stop("decryption operation unavailable") else waitForInput("crypto pending")
+                return
+            }
             operation = null
             decrypting = true
             val submitted = state.paymentWorker.submit(
