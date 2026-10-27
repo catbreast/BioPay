@@ -11,7 +11,6 @@ import android.os.CancellationSignal
 import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
-import android.view.ViewTreeObserver
 import io.github.kiriashi.biopay.BuildConfig
 import io.github.kiriashi.biopay.core.log.ModuleLog
 import io.github.kiriashi.biopay.core.util.MainTasks
@@ -85,14 +84,11 @@ object BiometricAuth {
                 restoreKeyboard(state, sessionId, attempt.id)
                 return false
             }
+            // Only hard failures discard here. Keyboard/window readiness is often
+            // still in flight at trigger time (cross-app payment handoffs above
+            // all), so those conditions are the presenter's to wait out, not a
+            // reason to drop the attempt.
             val preparationFailure = currentFailure(state, config, sessionId, attempt.id, activity)
-                ?: when {
-                    state.session.getCurrentKeyboardView() !== keyboardView -> "keyboard replaced"
-                    !keyboardView.isAttachedToWindow -> "keyboard detached"
-                    keyboardView.windowVisibility != View.VISIBLE || !keyboardView.isShown -> "keyboard hidden"
-                    keyboardView.rootView.context.findActivity()?.let { it !== activity } == true -> "window owner changed"
-                    else -> null
-                }
             if (preparationFailure != null) {
                 ModuleLog.d { "authentication preparation discarded: reason=$preparationFailure, app=${state.adapter.app}, session=$sessionId, attempt=${attempt.id}" }
                 callback.dispose()
@@ -349,20 +345,24 @@ object BiometricAuth {
         }
 
         private fun stop(reason: String) {
-            ModuleLog.d { "payment authentication ended: app=${state.adapter.app}, attempt=$attemptId, reason=$reason" }
+            ModuleLog.summary { "payment authentication ended: app=${state.adapter.app}, attempt=$attemptId, reason=$reason" }
             dispose()
             restoreKeyboard(state, sessionId, attemptId)
         }
     }
 
     /**
-     * Shows the framework prompt once the payment window actually holds focus.
-     * authenticate() issued while the host window is still settling (keyboard just
-     * attached, activity mid-transition) can leave the prompt unpresented until an
-     * unrelated focus shuffle — e.g. the volume panel — flushes it, which reads as
-     * "the prompt only appears after pressing a key". Waiting for a real focus
-     * event first removes that race; a bounded fallback shows the prompt anyway so
-     * a focus event that never arrives cannot stall the payment.
+     * Shows the framework prompt once the payment window is actually ready.
+     * The trigger fires from keyboard setup, which during cross-app payment
+     * handoffs (e.g. a shop app jumping into WeChat Pay) routinely happens
+     * while the host window is still in flight: not yet visible, not yet
+     * focused, or briefly owned by another activity of the handoff. Treating
+     * those states as fatal discards the attempt and leaves the plain
+     * keyboard up - the user then has to summon the prompt manually (volume
+     * key). Instead, soft readiness conditions are waited out with a short
+     * poll, mirroring the post-authentication input readiness loop; only
+     * hard invalidation (session or attempt superseded, keyboard replaced)
+     * discards. Outcomes are logged at INFO so release builds keep a record.
      */
     private class PromptPresenter(
         private val activity: Activity,
@@ -373,36 +373,54 @@ object BiometricAuth {
         private val attemptId: Long,
         private val signal: CancellationSignal,
         private val callback: BiometricAuthCallback
-    ) : ViewTreeObserver.OnWindowFocusChangeListener {
+    ) {
         private val tasks = MainTasks()
-        private val fallback = Runnable { showNow() }
+        private val poll = Runnable { check() }
+        private val startedAt = SystemClock.elapsedRealtime()
         @Volatile private var settled = false
 
-        fun show() {
-            if (hasWindowFocus()) showNow() else arm()
-        }
+        fun show() = check()
 
         fun cancel() {
             if (settled) return
             settled = true
-            disarm()
-        }
-
-        override fun onWindowFocusChanged(hasFocus: Boolean) {
-            if (hasFocus) showNow()
-        }
-
-        private fun arm() {
-            val observer = keyboardView.rootView.viewTreeObserver
-            if (observer.isAlive) observer.addOnWindowFocusChangeListener(this)
-            tasks.post(fallback, FOCUS_WAIT_MS)
-            ModuleLog.d { "prompt show deferred until window focus: app=${state.adapter.app}, attempt=$attemptId" }
-        }
-
-        private fun disarm() {
             tasks.close()
-            val observer = keyboardView.rootView.viewTreeObserver
-            if (observer.isAlive) observer.removeOnWindowFocusChangeListener(this)
+        }
+
+        private fun check() {
+            if (settled) return
+            val hard = currentFailure(state, config, sessionId, attemptId, activity)
+                ?: if (state.session.getCurrentKeyboardView() !== keyboardView) "keyboard replaced" else null
+            if (hard != null) {
+                discard(hard)
+                return
+            }
+            val soft = when {
+                !keyboardView.isAttachedToWindow -> "keyboard detached"
+                keyboardView.windowVisibility != View.VISIBLE || !keyboardView.isShown -> "keyboard hidden"
+                keyboardView.rootView.context.findActivity()?.let { it !== activity } == true -> "window owner changed"
+                !hasWindowFocus() -> "window not focused"
+                else -> null
+            }
+            if (soft == null) {
+                showNow()
+                return
+            }
+            if (SystemClock.elapsedRealtime() - startedAt >= SHOW_READY_TIMEOUT_MS) {
+                ModuleLog.w { "prompt show timed out: blocker=$soft, app=${state.adapter.app}, session=$sessionId, attempt=$attemptId" }
+                discard(soft)
+                return
+            }
+            tasks.post(poll, SHOW_READY_RETRY_MS)
+        }
+
+        private fun discard(reason: String) {
+            if (settled) return
+            settled = true
+            tasks.close()
+            ModuleLog.summary { "prompt discarded: reason=$reason, waited=${SystemClock.elapsedRealtime() - startedAt}ms, app=${state.adapter.app}, session=$sessionId, attempt=$attemptId" }
+            callback.dispose()
+            restoreKeyboard(state, sessionId, attemptId)
         }
 
         private fun hasWindowFocus(): Boolean {
@@ -415,23 +433,7 @@ object BiometricAuth {
         private fun showNow() {
             if (settled) return
             settled = true
-            disarm()
-            // Re-validate at the real show moment: the session may have moved on
-            // while waiting for focus.
-            val failure = currentFailure(state, config, sessionId, attemptId, activity)
-                ?: when {
-                    state.session.getCurrentKeyboardView() !== keyboardView -> "keyboard replaced"
-                    !keyboardView.isAttachedToWindow -> "keyboard detached"
-                    keyboardView.windowVisibility != View.VISIBLE || !keyboardView.isShown -> "keyboard hidden"
-                    keyboardView.rootView.context.findActivity()?.let { it !== activity } == true -> "window owner changed"
-                    else -> null
-                }
-            if (failure != null) {
-                ModuleLog.d { "deferred prompt discarded: reason=$failure, app=${state.adapter.app}, session=$sessionId, attempt=$attemptId" }
-                callback.dispose()
-                restoreKeyboard(state, sessionId, attemptId)
-                return
-            }
+            tasks.close()
             try {
                 val executor = activity.mainExecutor
                 val builder = BiometricPrompt.Builder(activity)
@@ -444,7 +446,7 @@ object BiometricAuth {
                 if (state.session.isCurrentAuthentication(attemptId)) {
                     // INVISIBLE preserves external payment keyboard attachment and the active prompt.
                     keyboardView.visibility = View.INVISIBLE
-                    ModuleLog.d { "trigger: type=${config.biometricType}, session=$sessionId, attempt=$attemptId" }
+                    ModuleLog.summary { "prompt shown: waited=${SystemClock.elapsedRealtime() - startedAt}ms, app=${state.adapter.app}, session=$sessionId, attempt=$attemptId" }
                 }
             } catch (error: Exception) {
                 callback.cancel()
@@ -455,5 +457,6 @@ object BiometricAuth {
 
     private const val INPUT_READY_TIMEOUT_MS = 2_000L
     private const val INPUT_READY_RETRY_MS = 50L
-    private const val FOCUS_WAIT_MS = 1_200L
+    private const val SHOW_READY_TIMEOUT_MS = 2_500L
+    private const val SHOW_READY_RETRY_MS = 75L
 }
