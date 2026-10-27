@@ -117,17 +117,25 @@ object BiometricAuth {
 
     private fun currentFailure(
         state: AppRuntime, config: PaymentConfig, sessionId: Long, attemptId: Long,
-        activity: Activity
-    ): String? = when {
-        state.isClosed -> "runtime closed"
-        !state.session.isCurrentSession(sessionId) -> "payment session expired"
-        !state.session.isCurrentAuthentication(attemptId) -> "authentication expired"
-        state.session.currentConfig() != config || !state.prefs.isCurrent(config) -> "settings changed"
-        state.session.getHostActivity() !== activity -> "payment host changed"
-        activity.isFinishing || activity.isDestroyed -> "payment host closed"
-        // Plugin hosts may expose a separate Application instance for the same package.
-        activity.packageName != state.app.packageName -> "payment owner changed"
-        else -> null
+        activity: Activity, pinHost: Boolean = true
+    ): String? {
+        // pinHost is for the trigger moment, when the resolved activity is fresh.
+        // Afterwards the session is the anchor: multi-activity payment flows
+        // (external cashier handoffs) legitimately rebind the host activity
+        // mid-attempt, and pinning the trigger-time instance aborts the
+        // post-authentication input for a host change that is not a new payment.
+        val host = if (pinHost) activity else state.session.getHostActivity() ?: return "payment host unavailable"
+        return when {
+            state.isClosed -> "runtime closed"
+            !state.session.isCurrentSession(sessionId) -> "payment session expired"
+            !state.session.isCurrentAuthentication(attemptId) -> "authentication expired"
+            state.session.currentConfig() != config || !state.prefs.isCurrent(config) -> "settings changed"
+            pinHost && state.session.getHostActivity() !== activity -> "payment host changed"
+            host.isFinishing || host.isDestroyed -> "payment host closed"
+            // Plugin hosts may expose a separate Application instance for the same package.
+            host.packageName != state.app.packageName -> "payment owner changed"
+            else -> null
+        }
     }
 
     private fun restoreKeyboard(state: AppRuntime, sessionId: Long, attemptId: Long) {
@@ -145,7 +153,7 @@ object BiometricAuth {
         private val attemptId: Long,
         private val signal: CancellationSignal
     ) : BiometricPrompt.AuthenticationCallback() {
-        private val window = WeakReference(keyboard.rootView as? ViewGroup)
+        private var window = WeakReference(keyboard.rootView as? ViewGroup)
         private val tasks = MainTasks()
         private val startedAt = SystemClock.uptimeMillis()
         private var operation: PasswordCipher.DecryptOperation? = null
@@ -215,7 +223,7 @@ object BiometricAuth {
         override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult?) {
             ModuleLog.d { "onAuthSucceeded received: attempt=$attemptId, elapsed=${SystemClock.uptimeMillis() - startedAt}ms" }
             if (authenticated || ended) return
-            currentFailure(state, config, sessionId, attemptId, activity)?.let {
+            currentFailure(state, config, sessionId, attemptId, activity, pinHost = false)?.let {
                 stop(it)
                 return
             }
@@ -232,28 +240,33 @@ object BiometricAuth {
         private fun continueInput() {
             if (ended || decrypting) return
             try {
-                currentFailure(state, config, sessionId, attemptId, activity)?.let {
+                currentFailure(state, config, sessionId, attemptId, activity, pinHost = false)?.let {
                     stop(it)
                     return
                 }
-                val root = window.get() ?: run { stop("payment window released"); return }
-                if (root.context.findActivity()?.let { it !== activity } == true) {
-                    stop("payment window owner changed")
-                    return
-                }
+                var root = window.get() ?: run { stop("payment window released"); return }
                 val keyboard = state.session.getCurrentKeyboardView()
-                if (keyboard == null || !keyboard.isAttachedToWindow || !root.isAttachedToWindow) {
+                if (keyboard == null || !keyboard.isAttachedToWindow) {
                     waitForInput("keyboard not attached")
                     return
                 }
-                // Authentication authorizes only the original payment window, even if its keypad is rebuilt.
-                if (keyboard.rootView !== root) {
-                    stop("payment window replaced")
-                    return
+                // The keypad window is routinely rebuilt while a payment settles
+                // (external handoffs above all). The session binding is the
+                // authorization anchor - prepareInput revalidates it against
+                // the current keyboard and input - so follow the current root
+                // instead of aborting on the trigger-time one.
+                val currentRoot = keyboard.rootView as? ViewGroup
+                if (currentRoot !== root) {
+                    if (currentRoot == null || !currentRoot.isAttachedToWindow) {
+                        waitForInput("keyboard not attached")
+                        return
+                    }
+                    window = WeakReference(currentRoot)
+                    root = currentRoot
                 }
                 keyboard.visibility = View.VISIBLE
                 // Non-focusable keypad popups use the Activity window's focus.
-                val hostWindow = activity.window?.decorView
+                val hostWindow = (state.session.getHostActivity() ?: activity).window?.decorView
                 val hasFocus = root.hasWindowFocus() ||
                     (hostWindow?.isAttachedToWindow == true && hostWindow.hasWindowFocus())
                 if (root.windowVisibility != View.VISIBLE || !hasFocus || !keyboard.isShown) {
@@ -299,7 +312,7 @@ object BiometricAuth {
             decrypting = true
             val submitted = state.paymentWorker.submit(
                 work = {
-                    if (!ended && currentFailure(state, config, sessionId, attemptId, activity) == null) {
+                    if (!ended && currentFailure(state, config, sessionId, attemptId, activity, pinHost = false) == null) {
                         measureCrypto("decrypt") { PasswordCipher.decryptToCharArray(pending) }
                     } else null
                 },
@@ -389,7 +402,7 @@ object BiometricAuth {
 
         private fun check() {
             if (settled) return
-            val hard = currentFailure(state, config, sessionId, attemptId, activity)
+            val hard = currentFailure(state, config, sessionId, attemptId, activity, pinHost = false)
                 ?: if (state.session.getCurrentKeyboardView() !== keyboardView) "keyboard replaced" else null
             if (hard != null) {
                 discard(hard)
@@ -455,7 +468,7 @@ object BiometricAuth {
         }
     }
 
-    private const val INPUT_READY_TIMEOUT_MS = 2_000L
+    private const val INPUT_READY_TIMEOUT_MS = 3_000L
     private const val INPUT_READY_RETRY_MS = 50L
     private const val SHOW_READY_TIMEOUT_MS = 2_500L
     private const val SHOW_READY_RETRY_MS = 75L
